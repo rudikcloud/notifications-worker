@@ -1,5 +1,12 @@
+from datetime import datetime, timezone
+
+from sqlalchemy import select
+
 from app.config import get_settings
+from app.database import SessionLocal
 from app.events import OrderCreatedEvent, parse_order_event
+from app.models import Order
+from app.notifications import mark_notification_sent
 from app.redis_client import create_redis_client
 
 
@@ -8,9 +15,25 @@ def process_event(event: OrderCreatedEvent) -> None:
         print(f"Skipping unsupported event_type={event.event_type}")
         return
 
-    # Placeholder for notification dispatch and persistence logic.
+    with SessionLocal() as db:
+        statement = select(Order).where(Order.id == event.order_id)
+        order = db.scalar(statement)
+        if order is None:
+            print(f"Order not found for event order_id={event.order_id}")
+            return
+
+        # Idempotency: if already sent, treat as success and skip re-send.
+        if order.notification_status == "sent":
+            print(f"Order already marked sent order_id={event.order_id}")
+            return
+
+        # Mock dispatch for now. Retry and failure simulation are added in later checkpoints.
+        _ = datetime.now(timezone.utc)
+        mark_notification_sent(db, order)
+        db.commit()
+
     print(
-        "Processed order.created "
+        "Notification sent "
         f"order_id={event.order_id} user_id={event.user_id} created_at={event.created_at}"
     )
 
