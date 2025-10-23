@@ -1,4 +1,5 @@
 from dataclasses import replace
+from datetime import datetime, timezone
 import time
 
 from redis import Redis
@@ -25,6 +26,21 @@ def schedule_retry(redis_client: Redis, settings: Settings, event: OrderCreatedE
     next_retry_epoch = compute_next_retry_epoch(event.attempts)
     member = encode_retry_member(event)
     redis_client.zadd(settings.orders_retry_zset, {member: next_retry_epoch})
+
+
+def push_to_dlq(
+    redis_client: Redis,
+    settings: Settings,
+    event: OrderCreatedEvent,
+    *,
+    attempts: int,
+    error_message: str,
+) -> None:
+    payload = event.to_payload()
+    payload["attempts"] = str(attempts)
+    payload["error"] = error_message[:255]
+    payload["failed_at"] = datetime.now(timezone.utc).isoformat()
+    redis_client.xadd(settings.orders_dlq_stream, payload)
 
 
 def process_event(event: OrderCreatedEvent, redis_client: Redis, settings: Settings) -> None:
@@ -59,6 +75,13 @@ def process_event(event: OrderCreatedEvent, redis_client: Redis, settings: Setti
                     error_message=str(exc),
                 )
                 db.commit()
+                push_to_dlq(
+                    redis_client,
+                    settings,
+                    event,
+                    attempts=attempt_number,
+                    error_message=str(exc),
+                )
                 print(
                     f"Notification permanently failed order_id={event.order_id} "
                     f"attempt={attempt_number}"
