@@ -16,10 +16,7 @@ from app.retry import (
     decode_retry_member,
     encode_retry_member,
 )
-
-
-def send_notification(_: OrderCreatedEvent) -> None:
-    return
+from app.sender import send_notification
 
 
 def schedule_retry(redis_client: Redis, settings: Settings, event: OrderCreatedEvent) -> None:
@@ -61,7 +58,7 @@ def process_event(event: OrderCreatedEvent, redis_client: Redis, settings: Setti
             return
 
         try:
-            send_notification(event)
+            send_notification(event, settings)
             mark_notification_sent(db, order)
             db.commit()
         except Exception as exc:
