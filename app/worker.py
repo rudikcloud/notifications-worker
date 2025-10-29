@@ -15,6 +15,7 @@ from app.retry import (
     compute_next_retry_epoch,
     decode_retry_member,
     encode_retry_member,
+    status_for_attempt,
 )
 from app.sender import send_notification
 
@@ -63,11 +64,12 @@ def process_event(event: OrderCreatedEvent, redis_client: Redis, settings: Setti
             db.commit()
         except Exception as exc:
             attempt_number = max(order.notification_attempts, event.attempts) + 1
-            if attempt_number >= settings.max_attempts:
+            status = status_for_attempt(attempt_number, settings.max_attempts)
+            if status == "failed":
                 mark_notification_error(
                     db,
                     order,
-                    status="failed",
+                    status=status,
                     attempts=attempt_number,
                     error_message=str(exc),
                 )
@@ -89,7 +91,7 @@ def process_event(event: OrderCreatedEvent, redis_client: Redis, settings: Setti
             mark_notification_error(
                 db,
                 order,
-                status="retrying",
+                status=status,
                 attempts=attempt_number,
                 error_message=str(exc),
             )

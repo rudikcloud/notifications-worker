@@ -17,6 +17,12 @@ def compute_next_retry_epoch(attempt_number: int, *, now_epoch: float | None = N
     return now + float(compute_backoff_seconds(attempt_number))
 
 
+def status_for_attempt(attempt_number: int, max_attempts: int) -> str:
+    if attempt_number >= max_attempts:
+        return "failed"
+    return "retrying"
+
+
 def encode_retry_member(event: OrderCreatedEvent) -> str:
     return json.dumps(event.to_payload(), sort_keys=True)
 
