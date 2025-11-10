@@ -10,6 +10,7 @@ from app.database import SessionLocal
 from app.events import OrderCreatedEvent, parse_order_event
 from app.models import Order
 from app.notifications import mark_notification_error, mark_notification_sent
+from app.observability import get_tracer, setup_telemetry
 from app.redis_client import create_redis_client
 from app.retry import (
     compute_next_retry_epoch,
@@ -18,6 +19,8 @@ from app.retry import (
     status_for_attempt,
 )
 from app.sender import send_notification
+
+TRACER = get_tracer("notifications-worker.worker")
 
 
 def schedule_retry(redis_client: Redis, settings: Settings, event: OrderCreatedEvent) -> None:
@@ -42,30 +45,66 @@ def push_to_dlq(
 
 
 def process_event(event: OrderCreatedEvent, redis_client: Redis, settings: Settings) -> None:
-    if event.event_type != "order.created":
-        print(f"Skipping unsupported event_type={event.event_type}")
-        return
+    with TRACER.start_as_current_span("notifications.process_event") as span:
+        span.set_attribute("event.type", event.event_type)
+        span.set_attribute("order.id", event.order_id)
+        span.set_attribute("user.id", event.user_id)
 
-    with SessionLocal() as db:
-        statement = select(Order).where(Order.id == event.order_id)
-        order = db.scalar(statement)
-        if order is None:
-            print(f"Order not found for event order_id={event.order_id}")
+        if event.event_type != "order.created":
+            span.set_attribute("event.skipped", True)
+            print(f"Skipping unsupported event_type={event.event_type}")
             return
 
-        # Idempotency: if already sent, treat as success and skip re-send.
-        if order.notification_status == "sent":
-            print(f"Order already marked sent order_id={event.order_id}")
-            return
+        with SessionLocal() as db:
+            statement = select(Order).where(Order.id == event.order_id)
+            order = db.scalar(statement)
+            if order is None:
+                span.set_attribute("order.missing", True)
+                print(f"Order not found for event order_id={event.order_id}")
+                return
 
-        try:
-            send_notification(event, settings)
-            mark_notification_sent(db, order)
-            db.commit()
-        except Exception as exc:
-            attempt_number = max(order.notification_attempts, event.attempts) + 1
-            status = status_for_attempt(attempt_number, settings.max_attempts)
-            if status == "failed":
+            # Idempotency: if already sent, treat as success and skip re-send.
+            if order.notification_status == "sent":
+                span.set_attribute("notification.status", "sent")
+                span.set_attribute("notification.idempotent_skip", True)
+                print(f"Order already marked sent order_id={event.order_id}")
+                return
+
+            try:
+                send_notification(event, settings)
+                mark_notification_sent(db, order)
+                db.commit()
+                span.set_attribute("notification.status", "sent")
+            except Exception as exc:
+                span.record_exception(exc)
+                attempt_number = max(order.notification_attempts, event.attempts) + 1
+                status = status_for_attempt(attempt_number, settings.max_attempts)
+                span.set_attribute("notification.attempt", attempt_number)
+                span.set_attribute("notification.status", status)
+                span.set_attribute("notification.error", str(exc)[:255])
+                if status == "failed":
+                    mark_notification_error(
+                        db,
+                        order,
+                        status=status,
+                        attempts=attempt_number,
+                        error_message=str(exc),
+                    )
+                    db.commit()
+                    push_to_dlq(
+                        redis_client,
+                        settings,
+                        event,
+                        attempts=attempt_number,
+                        error_message=str(exc),
+                    )
+                    print(
+                        f"Notification permanently failed order_id={event.order_id} "
+                        f"attempt={attempt_number}"
+                    )
+                    return
+
+                retry_event = replace(event, attempts=attempt_number)
                 mark_notification_error(
                     db,
                     order,
@@ -74,39 +113,17 @@ def process_event(event: OrderCreatedEvent, redis_client: Redis, settings: Setti
                     error_message=str(exc),
                 )
                 db.commit()
-                push_to_dlq(
-                    redis_client,
-                    settings,
-                    event,
-                    attempts=attempt_number,
-                    error_message=str(exc),
-                )
+                schedule_retry(redis_client, settings, retry_event)
                 print(
-                    f"Notification permanently failed order_id={event.order_id} "
+                    f"Notification failed; scheduled retry order_id={event.order_id} "
                     f"attempt={attempt_number}"
                 )
                 return
 
-            retry_event = replace(event, attempts=attempt_number)
-            mark_notification_error(
-                db,
-                order,
-                status=status,
-                attempts=attempt_number,
-                error_message=str(exc),
-            )
-            db.commit()
-            schedule_retry(redis_client, settings, retry_event)
             print(
-                f"Notification failed; scheduled retry order_id={event.order_id} "
-                f"attempt={attempt_number}"
+                "Notification sent "
+                f"order_id={event.order_id} user_id={event.user_id} created_at={event.created_at}"
             )
-            return
-
-    print(
-        "Notification sent "
-        f"order_id={event.order_id} user_id={event.user_id} created_at={event.created_at}"
-    )
 
 
 def process_due_retries(redis_client: Redis, settings: Settings) -> None:
@@ -131,6 +148,7 @@ def process_due_retries(redis_client: Redis, settings: Settings) -> None:
 
 def run() -> None:
     settings = get_settings()
+    setup_telemetry("notifications-worker")
     redis_client = create_redis_client(settings)
     last_id = "$"
 
