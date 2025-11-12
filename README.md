@@ -31,6 +31,12 @@ Copy `.env.example` to `.env` when running locally.
 - `MAX_ATTEMPTS`: Maximum delivery attempts before DLQ (default `5`).
 - `WORKER_POLL_INTERVAL_MS`: Poll interval for stream + retry checks (default `500`).
 - `FAIL_MODE`: Failure simulator: `off`, `always`, `random` (~30% fail).
+- `OTEL_EXPORTER_OTLP_ENDPOINT`: OTLP collector endpoint for trace export.
+  - Local host example: `http://localhost:4317`
+  - Docker Compose example: `http://otel-collector:4317`
+- `OTEL_SERVICE_NAME`: OpenTelemetry service name (default `notifications-worker`).
+- `OTEL_SERVICE_VERSION`: service version attribute (default `0.1.0`).
+- `OTEL_ENVIRONMENT`: deployment environment attribute (default `local`).
 
 ## Run locally
 
@@ -102,3 +108,14 @@ docker compose logs -f notifications-worker
 ```bash
 docker compose exec -T redis redis-cli XRANGE orders.dlq - +
 ```
+
+## Observability quick check
+
+Worker processing creates a `notifications.process_event` span and sets `order.id` as a span attribute.
+
+To verify:
+
+1. Start infra observability stack and worker.
+2. Create an order through `orders-service`.
+3. In Grafana Explore (Tempo datasource), search traces with `service.name=notifications-worker`.
+4. Open a trace and confirm the processing span contains `order.id`.
