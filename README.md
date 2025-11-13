@@ -1,51 +1,60 @@
 # notifications-worker
 
-Background worker for RudikCloud Milestone 4 notifications reliability.
+`notifications-worker` is the asynchronous reliability component in RudikCloud. It consumes order events, attempts notification delivery, updates order status, retries with backoff, and dead-letters exhausted events.
 
-## What it does
+## Queue and Retry Model
 
-- Consumes `order.created` events from Redis stream `orders.events`
-- Updates notification fields on `orders` rows in Postgres
-- Retries failures using exponential backoff in Redis sorted set `orders.retry`
-- Moves permanently failing events to dead-letter stream `orders.dlq`
-- Supports failure simulation with `FAIL_MODE=off|always|random`
+- Input stream: `orders.events` (Redis Stream)
+- Retry queue: `orders.retry` (Redis ZSET, score = next retry epoch)
+- Dead letter queue: `orders.dlq` (Redis Stream)
 
-## Notification lifecycle
+## What It Updates on Orders
 
-- Initial order state: `pending`
-- Success: `sent`
-- Failed but retryable: `retrying`
-- Max attempts exceeded: `failed` + event moved to DLQ
+For each processed order, worker updates:
 
-Idempotency rule: if an order is already `sent`, the worker skips re-sending and treats it as success.
+- `notification_status` in `{pending, retrying, sent, failed}`
+- `notification_attempts`
+- `notification_last_error` (nullable)
+- `notification_last_attempt_at` (nullable)
 
-## Environment variables
+Idempotency: if an order is already `sent`, it is not sent again.
 
-Copy `.env.example` to `.env` when running locally.
+## Retry Policy and Failure Modes
 
-- `DATABASE_URL`: Postgres connection string for orders table updates.
-- `REDIS_URL`: Redis connection string used for streams and retry zset.
-- `ORDERS_EVENTS_STREAM`: Incoming order event stream name (default `orders.events`).
-- `ORDERS_RETRY_ZSET`: Retry queue zset name (default `orders.retry`).
-- `ORDERS_DLQ_STREAM`: Dead-letter stream name (default `orders.dlq`).
-- `MAX_ATTEMPTS`: Maximum delivery attempts before DLQ (default `5`).
-- `WORKER_POLL_INTERVAL_MS`: Poll interval for stream + retry checks (default `500`).
-- `FAIL_MODE`: Failure simulator: `off`, `always`, `random` (~30% fail).
-- `OTEL_EXPORTER_OTLP_ENDPOINT`: OTLP collector endpoint for trace export.
-  - Local host example: `http://localhost:4317`
-  - Docker Compose example: `http://otel-collector:4317`
-- `OTEL_SERVICE_NAME`: OpenTelemetry service name (default `notifications-worker`).
-- `OTEL_SERVICE_VERSION`: service version attribute (default `0.1.0`).
-- `OTEL_ENVIRONMENT`: deployment environment attribute (default `local`).
+- Exponential backoff between attempts.
+- Max attempts controlled by `MAX_ATTEMPTS`.
+- When attempts exceed max, payload is pushed to DLQ and order is marked `failed`.
 
-## Run locally
+Failure simulation (`FAIL_MODE`):
+
+- `off`: normal behavior
+- `always`: every send attempt fails
+- `random`: approximately 30% attempts fail
+
+## Environment Variables
+
+Copy `.env.example` to `.env` for local runs.
+
+- `DATABASE_URL`: Postgres connection string.
+- `REDIS_URL`: Redis connection string.
+- `ORDERS_EVENTS_STREAM`: Input stream name (default `orders.events`).
+- `ORDERS_RETRY_ZSET`: Retry queue name (default `orders.retry`).
+- `ORDERS_DLQ_STREAM`: DLQ stream name (default `orders.dlq`).
+- `MAX_ATTEMPTS`: Max delivery attempts (default `5`).
+- `WORKER_POLL_INTERVAL_MS`: Poll interval in ms (default `500`).
+- `FAIL_MODE`: `off|always|random`.
+- `OTEL_EXPORTER_OTLP_ENDPOINT`: OTLP endpoint.
+- `OTEL_SERVICE_NAME`: Telemetry service name.
+- `OTEL_SERVICE_VERSION`: Telemetry service version.
+- `OTEL_ENVIRONMENT`: Telemetry environment label.
+
+## Run Locally
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-set -a; source .env; set +a
 python -m app.worker
 ```
 
@@ -62,60 +71,31 @@ docker run --rm --env-file .env.example notifications-worker
 pytest -q
 ```
 
-## Milestone 4 demo steps (with infra compose)
+## Demo: Force Failures to DLQ
 
-1. Start stack from `infra/`:
-
-```bash
-docker compose up --build
-```
-
-2. Login through auth-service and keep cookie:
+1. In `infra/.env`, set:
 
 ```bash
-curl -i -c cookies.txt -X POST http://127.0.0.1:8001/auth/login \
-  -H 'Content-Type: application/json' \
-  -d '{"email":"user@example.com","password":"password123"}'
+NOTIFICATIONS_FAIL_MODE=always
 ```
 
-3. Create an order:
+2. Restart worker:
 
 ```bash
-curl -i -b cookies.txt -X POST http://127.0.0.1:8002/orders \
-  -H 'Content-Type: application/json' \
-  -d '{"item_name":"Keyboard","quantity":1}'
+docker compose -f ../infra/docker-compose.yml up -d --build notifications-worker
 ```
 
-4. Confirm worker effect in orders response:
+3. Create order via dashboard or orders API.
+4. Watch retries and terminal failure:
 
 ```bash
-curl -i -b cookies.txt http://127.0.0.1:8002/orders
+docker compose -f ../infra/docker-compose.yml logs -f notifications-worker
 ```
 
-### Demo retries + DLQ
-
-1. Set worker `FAIL_MODE=always` in `infra/.env`.
-2. Restart worker (`docker compose up -d --build notifications-worker`).
-3. Create a new order.
-4. Watch worker logs and confirm retries then failure:
+5. Confirm failed payload in DLQ:
 
 ```bash
-docker compose logs -f notifications-worker
+docker compose -f ../infra/docker-compose.yml exec -T redis redis-cli XRANGE orders.dlq - +
 ```
 
-5. Inspect DLQ stream entries:
-
-```bash
-docker compose exec -T redis redis-cli XRANGE orders.dlq - +
-```
-
-## Observability quick check
-
-Worker processing creates a `notifications.process_event` span and sets `order.id` as a span attribute.
-
-To verify:
-
-1. Start infra observability stack and worker.
-2. Create an order through `orders-service`.
-3. In Grafana Explore (Tempo datasource), search traces with `service.name=notifications-worker`.
-4. Open a trace and confirm the processing span contains `order.id`.
+6. Inspect `/orders` and verify status progression to `failed`.
