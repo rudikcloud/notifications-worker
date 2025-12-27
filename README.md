@@ -1,3 +1,5 @@
+[![CI](https://github.com/rudikcloud/notifications-worker/actions/workflows/ci.yml/badge.svg)](https://github.com/rudikcloud/notifications-worker/actions/workflows/ci.yml)
+
 # notifications-worker
 
 `notifications-worker` is the asynchronous reliability component in RudikCloud. It consumes order events, attempts notification delivery, updates order status, retries with backoff, and dead-letters exhausted events.
